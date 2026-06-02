@@ -1,5 +1,4 @@
-def main():
-    print("Hello from recursive-unzip-tool!")
+from recursive_unzip_tool.gui import main
 
 
 if __name__ == "__main__":
