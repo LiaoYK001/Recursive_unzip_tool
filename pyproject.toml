@@ -9,7 +9,7 @@ description = "A modern GUI tool for recursively extracting archives in a target
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "pyside6>=6.9",
+    "pyside6>=6.9,<6.10",
     "py7zr>=1.0",
 ]
 

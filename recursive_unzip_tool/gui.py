@@ -152,6 +152,7 @@ class MainWindow(QMainWindow):
 
         option_row = QHBoxLayout()
         option_row.addWidget(format_group, 1)
+        option_row.addSpacing(12)
         option_row.addWidget(self.delete_checkbox)
 
         control_layout.addLayout(option_row, 1, 0, 1, 3)
@@ -286,6 +287,28 @@ class MainWindow(QMainWindow):
             }
             QCheckBox {
                 spacing: 8px;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+                border: 2px solid #8da1b7;
+                border-radius: 4px;
+                background: #ffffff;
+            }
+            QCheckBox::indicator:hover {
+                border-color: #0f8b8d;
+            }
+            QCheckBox::indicator:checked {
+                background: #0f8b8d;
+                border-color: #0f8b8d;
+            }
+            QCheckBox::indicator:checked:hover {
+                background: #0b7476;
+                border-color: #0b7476;
+            }
+            QCheckBox::indicator:disabled {
+                background: #e8edf3;
+                border-color: #c9d3df;
             }
             QCheckBox#DangerOption {
                 color: #9b2c2c;

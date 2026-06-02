@@ -17,8 +17,10 @@
 推荐使用 `uv`：
 
 ```powershell
-uv sync
+uv sync --group dev
 ```
+
+`uv` 会默认使用项目目录下的 `.venv`。如果当前 PowerShell 里激活的是其他环境，例如 `rut1`，`uv sync` 仍会优先同步 `.venv`。
 
 或使用 `pip`：
 
@@ -29,13 +31,19 @@ python -m pip install -e .
 ## 运行
 
 ```powershell
-python main.py
+uv run python main.py
+```
+
+也可以直接使用 uv 创建的解释器：
+
+```powershell
+.\.venv\Scripts\python.exe main.py
 ```
 
 安装为可编辑包后，也可以运行：
 
 ```powershell
-recursive-unzip-tool
+uv run recursive-unzip-tool
 ```
 
 ## 使用
