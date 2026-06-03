@@ -138,7 +138,7 @@ def scan_archives(
                     archive_format=archive_format or "file",
                     size=size,
                     is_archive=is_archive,
-                    selected=is_archive,
+                    selected=True,
                 )
             )
 

@@ -94,8 +94,9 @@ def test_scan_archives_show_all_files_marks_regular_files_not_executable(tmp_pat
 
     by_name = {item.path.name: item for item in result.items}
     assert by_name["bundle.zip"].is_archive is True
+    assert by_name["bundle.zip"].selected is True
     assert by_name["notes.txt"].is_archive is False
-    assert by_name["notes.txt"].selected is False
+    assert by_name["notes.txt"].selected is True
 
 
 def test_extract_selected_only_processes_selected_archive_items(tmp_path: Path) -> None:

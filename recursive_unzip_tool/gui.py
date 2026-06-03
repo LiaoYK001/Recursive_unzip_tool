@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -49,6 +49,8 @@ FORMAT_OPTIONS = {
     ".7z": "7Z",
     ".tar*": "TAR 系列",
 }
+
+CHECK_MARK = "√"
 
 
 @dataclass(slots=True)
@@ -281,11 +283,15 @@ class MainWindow(QMainWindow):
         self.cancel_button.clicked.connect(self._cancel_current_task)
         self.settings_button = QPushButton("设置")
         self.settings_button.clicked.connect(self._open_settings)
+        self.show_all_checkbox = QCheckBox("显示所有文件")
+        self.show_all_checkbox.setChecked(self.settings.show_all_files)
+        self.show_all_checkbox.toggled.connect(self._on_show_all_toggled)
 
         button_row = QHBoxLayout()
         button_row.addWidget(self.scan_button)
         button_row.addWidget(self.execute_button)
         button_row.addWidget(self.retry_button)
+        button_row.addWidget(self.show_all_checkbox)
         button_row.addStretch(1)
         button_row.addWidget(self.settings_button)
         button_row.addWidget(self.cancel_button)
@@ -303,17 +309,19 @@ class MainWindow(QMainWindow):
         root_layout.addLayout(progress_row)
 
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["名称", "相对路径", "格式", "大小", "状态", "错误/建议"])
+        self.tree.setHeaderLabels(["执行", "名称", "相对路径", "格式", "大小", "状态", "错误/建议"])
         self.tree.setAlternatingRowColors(True)
         self.tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
         self.tree.setUniformRowHeights(True)
-        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.tree.setColumnWidth(0, 56)
+        self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.tree.header().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.tree.header().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        self.tree.header().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
-        self.tree.itemChanged.connect(self._handle_tree_item_changed)
+        self.tree.header().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.header().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        self.tree.itemClicked.connect(self._handle_tree_item_clicked)
         self.tree.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         root_layout.addWidget(self.tree, 1)
 
@@ -363,7 +371,8 @@ class MainWindow(QMainWindow):
                 background: #ffffff;
                 border: 1px solid #cfd8e5;
                 border-radius: 6px;
-                selection-background-color: #0f8b8d;
+                selection-background-color: #d7efef;
+                selection-color: #172033;
             }
             QLineEdit {
                 padding: 8px 10px;
@@ -457,6 +466,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "缺少格式", "请至少选择一种压缩格式。")
                 return
             self.settings = selected
+            self.show_all_checkbox.setChecked(self.settings.show_all_files)
             self._append_log(
                 "设置已更新："
                 f"格式={', '.join(self.settings.enabled_formats)}，"
@@ -464,6 +474,11 @@ class MainWindow(QMainWindow):
                 f"显示所有文件={'是' if self.settings.show_all_files else '否'}，"
                 f"删除源文件={'是' if self.settings.delete_source else '否'}"
             )
+
+    @Slot(bool)
+    def _on_show_all_toggled(self, checked: bool) -> None:
+        self.settings.show_all_files = checked
+        self._append_log(f"{'显示' if checked else '隐藏'}所有文件（重新扫描后生效）")
 
     @Slot()
     def _start_scan(self) -> None:
@@ -501,7 +516,7 @@ class MainWindow(QMainWindow):
     def _start_execution(self) -> None:
         selected_items = self._selected_archive_items()
         if not selected_items:
-            QMessageBox.information(self, "没有选中文件", "请先勾选至少一个压缩包。")
+            QMessageBox.information(self, "没有选中文件", "请先选择至少一个压缩包。")
             return
         self._run_execution(selected_items, "开始执行")
 
@@ -515,6 +530,7 @@ class MainWindow(QMainWindow):
             return
         for item in retry_items:
             item.selected = True
+            self._update_tree_item(item)
         self._run_execution(retry_items, "重试失败")
 
     def _run_execution(self, items: list[ArchiveItem], action_name: str) -> None:
@@ -643,15 +659,17 @@ class MainWindow(QMainWindow):
         self.current_mode = None
 
     @Slot(QTreeWidgetItem, int)
-    def _handle_tree_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
-        if column != 0:
+    def _handle_tree_item_clicked(self, item: QTreeWidgetItem, column: int) -> None:
+        if column != 0 or self.current_mode:
             return
         path = item.data(0, Qt.ItemDataRole.UserRole)
         if not path:
             return
         archive_item = self.items_by_path.get(path)
-        if archive_item:
-            archive_item.selected = item.checkState(0) == Qt.CheckState.Checked
+        if not archive_item or not archive_item.is_archive:
+            return
+        archive_item.selected = not archive_item.selected
+        self._update_tree_item(archive_item)
         self._refresh_action_state()
 
     def _set_running(self, mode: str | None) -> None:
@@ -662,6 +680,7 @@ class MainWindow(QMainWindow):
         self.retry_button.setEnabled(not running and bool(self.failed_paths))
         self.cancel_button.setEnabled(running)
         self.settings_button.setEnabled(not running)
+        self.show_all_checkbox.setEnabled(not running)
         self.browse_button.setEnabled(not running)
         self.path_input.setEnabled(not running)
 
@@ -672,7 +691,6 @@ class MainWindow(QMainWindow):
         self.retry_button.setEnabled(bool(self.failed_paths))
 
     def _populate_tree(self, scan_result: ScanResult) -> None:
-        self.tree.blockSignals(True)
         self.tree.clear()
         self.items_by_path.clear()
         self.tree_items_by_path.clear()
@@ -687,32 +705,36 @@ class MainWindow(QMainWindow):
             for depth in range(len(parts) - 1):
                 dir_key = parts[: depth + 1]
                 if dir_key not in directory_nodes:
-                    node = QTreeWidgetItem([parts[depth], str(Path(*dir_key)), "", "", "", ""])
-                    node.setFirstColumnSpanned(False)
+                    node = QTreeWidgetItem(["", parts[depth], str(Path(*dir_key)), "", "", "", ""])
                     node.setExpanded(True)
                     directory_nodes[dir_key] = node
                     parent.addChild(node)
                 parent = directory_nodes[dir_key]
 
             leaf = QTreeWidgetItem()
-            leaf.setText(0, item.path.name)
-            leaf.setText(1, str(item.relative_path))
-            leaf.setText(2, item.archive_format)
-            leaf.setText(3, _format_size(item.size))
-            leaf.setText(4, _display_status(item.status))
-            leaf.setText(5, "")
+            leaf.setText(0, CHECK_MARK if item.is_archive and item.selected else "")
+            leaf.setText(1, item.path.name)
+            leaf.setText(2, str(item.relative_path))
+            leaf.setText(3, item.archive_format)
+            leaf.setText(4, _format_size(item.size))
+            leaf.setText(5, _display_status(item.status) if item.is_archive else "不可执行")
+            leaf.setText(6, "")
             leaf.setData(0, Qt.ItemDataRole.UserRole, path_key)
+            leaf.setTextAlignment(0, Qt.AlignmentFlag.AlignCenter)
+            leaf.setToolTip(0, "点击切换是否执行" if item.is_archive else "普通文件不可执行")
+
             if item.is_archive:
-                leaf.setFlags(leaf.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                leaf.setCheckState(0, Qt.CheckState.Checked if item.selected else Qt.CheckState.Unchecked)
+                for col in range(7):
+                    leaf.setForeground(col, QColor("#0f8b8d"))
+                    leaf.setFont(col, _bold_font())
+                leaf.setBackground(0, QColor("#e3f5f5"))
             else:
-                leaf.setFlags(leaf.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
-                leaf.setText(4, "不可执行")
+                for col in range(7):
+                    leaf.setForeground(col, QColor("#98a2b3"))
             parent.addChild(leaf)
             self.tree_items_by_path[path_key] = leaf
 
         self.tree.expandAll()
-        self.tree.blockSignals(False)
         self._refresh_action_state()
 
     def _selected_archive_items(self) -> list[ArchiveItem]:
@@ -722,17 +744,23 @@ class MainWindow(QMainWindow):
         tree_item = self.tree_items_by_path.get(str(item.path))
         if not tree_item:
             return
-        tree_item.setText(4, _display_status(item.status))
+        tree_item.setText(0, CHECK_MARK if item.is_archive and item.selected else "")
+        tree_item.setBackground(0, QColor("#e3f5f5") if item.selected and item.is_archive else QColor("#ffffff"))
+        tree_item.setText(5, _display_status(item.status) if item.is_archive else "不可执行")
         details = item.error
         if item.suggestion:
             details = f"{details}；建议：{item.suggestion}" if details else item.suggestion
-        tree_item.setText(5, details)
-        if item.is_archive:
-            tree_item.setCheckState(0, Qt.CheckState.Checked if item.selected else Qt.CheckState.Unchecked)
+        tree_item.setText(6, details)
 
     def _append_log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_output.appendPlainText(f"[{timestamp}] {message}")
+
+
+def _bold_font() -> QFont:
+    font = QFont()
+    font.setBold(True)
+    return font
 
 
 def _display_status(status: str) -> str:
