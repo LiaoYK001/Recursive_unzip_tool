@@ -12,6 +12,7 @@ from .extractor import (
     extract_recursive,
     extract_selected,
     find_archives,
+    get_archive_uncompressed_size,
     scan_archives,
 )
 
@@ -27,5 +28,6 @@ __all__ = [
     "extract_recursive",
     "extract_selected",
     "find_archives",
+    "get_archive_uncompressed_size",
     "scan_archives",
 ]

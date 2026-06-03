@@ -49,6 +49,9 @@ class ArchiveItem:
     relative_path: Path
     archive_format: str
     size: int
+    compressed_size: int
+    uncompressed_size: int | None
+    modified_time: float | None
     is_archive: bool
     selected: bool = True
     status: str = "pending"
@@ -127,9 +130,19 @@ def scan_archives(
                 continue
 
             try:
-                size = file_path.stat().st_size
+                stat_result = file_path.stat()
+                size = stat_result.st_size
+                modified_time = stat_result.st_mtime
             except OSError:
                 size = 0
+                modified_time = None
+
+            uncompressed_size = None
+            if is_archive:
+                try:
+                    uncompressed_size = get_archive_uncompressed_size(file_path, archive_format)
+                except Exception:
+                    uncompressed_size = None
 
             items.append(
                 ArchiveItem(
@@ -137,6 +150,9 @@ def scan_archives(
                     relative_path=file_path.relative_to(root_path),
                     archive_format=archive_format or "file",
                     size=size,
+                    compressed_size=size,
+                    uncompressed_size=uncompressed_size,
+                    modified_time=modified_time,
                     is_archive=is_archive,
                     selected=True,
                 )
@@ -195,6 +211,34 @@ def extract_archive(path: str | Path, delete_source: bool = False) -> ExtractRes
         )
     except Exception as exc:  # noqa: BLE001 - expose archive-specific failures to the UI.
         return _failed_result(archive_path, archive_format, exc)
+
+
+def get_archive_uncompressed_size(path: str | Path, archive_format: str) -> int | None:
+    archive_path = Path(path)
+    if archive_format == ".zip":
+        with zipfile.ZipFile(archive_path) as archive:
+            return sum(member.file_size for member in archive.infolist() if not member.is_dir())
+
+    if archive_format in TAR_EXTENSIONS:
+        with tarfile.open(archive_path) as archive:
+            return sum(member.size for member in archive.getmembers() if member.isfile())
+
+    if archive_format == ".7z":
+        try:
+            import py7zr
+        except ImportError as exc:
+            raise RuntimeError("缺少 py7zr 依赖，无法读取 .7z 文件信息") from exc
+
+        total = 0
+        with py7zr.SevenZipFile(archive_path, mode="r") as archive:
+            for member in archive.list():
+                uncompressed = getattr(member, "uncompressed", None)
+                if uncompressed is None:
+                    return None
+                total += int(uncompressed)
+        return total
+
+    return None
 
 
 def extract_selected(

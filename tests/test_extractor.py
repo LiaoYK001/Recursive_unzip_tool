@@ -14,6 +14,7 @@ from recursive_unzip_tool.extractor import (
     extract_recursive,
     extract_selected,
     find_archives,
+    get_archive_uncompressed_size,
     scan_archives,
 )
 
@@ -47,6 +48,9 @@ def test_scan_archives_returns_archive_metadata(tmp_path: Path) -> None:
     assert item.relative_path == Path("level1/level2/bundle.zip")
     assert item.archive_format == ".zip"
     assert item.size > 0
+    assert item.compressed_size == item.size
+    assert item.uncompressed_size == len("zip content")
+    assert item.modified_time is not None
     assert item.is_archive is True
     assert item.selected is True
     assert result.scanned_dirs == 3
@@ -95,8 +99,10 @@ def test_scan_archives_show_all_files_marks_regular_files_not_executable(tmp_pat
     by_name = {item.path.name: item for item in result.items}
     assert by_name["bundle.zip"].is_archive is True
     assert by_name["bundle.zip"].selected is True
+    assert by_name["bundle.zip"].uncompressed_size == len("ok")
     assert by_name["notes.txt"].is_archive is False
     assert by_name["notes.txt"].selected is True
+    assert by_name["notes.txt"].uncompressed_size is None
 
 
 def test_extract_selected_only_processes_selected_archive_items(tmp_path: Path) -> None:
@@ -177,6 +183,30 @@ def test_extract_recursive_legacy_wrapper_extracts_tar_gz(tmp_path: Path) -> Non
     assert len(results) == 1
     assert results[0].status == "success"
     assert (archive_dir / "source.txt").read_text(encoding="utf-8") == "tar content"
+
+
+def test_scan_archives_reports_tar_gz_uncompressed_size(tmp_path: Path) -> None:
+    source_file = tmp_path / "source.txt"
+    source_file.write_text("tar content", encoding="utf-8")
+    archive_path = tmp_path / "bundle.tar.gz"
+    _make_tar_gz(archive_path, source_file)
+
+    result = scan_archives(tmp_path, ScanOptions(enabled_formats=(".tar*",)))
+
+    assert len(result.items) == 1
+    assert result.items[0].path == archive_path
+    assert result.items[0].uncompressed_size == len("tar content")
+
+
+def test_get_archive_uncompressed_size_reports_7z_size(tmp_path: Path) -> None:
+    source_file = tmp_path / "source.txt"
+    source_file.write_text("7z content", encoding="utf-8")
+    archive_path = tmp_path / "bundle.7z"
+    _make_7z(archive_path, source_file)
+
+    size = get_archive_uncompressed_size(archive_path, ".7z")
+
+    assert size == len("7z content")
 
 
 def test_find_archives_legacy_wrapper(tmp_path: Path) -> None:

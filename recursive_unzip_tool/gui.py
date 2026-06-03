@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
-from PySide6.QtGui import QColor, QFont, QPalette
+from PySide6.QtCore import QObject, QPoint, Qt, QThread, QUrl, Signal, Slot
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -20,6 +22,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
@@ -309,10 +312,11 @@ class MainWindow(QMainWindow):
         root_layout.addLayout(progress_row)
 
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["执行", "名称", "相对路径", "格式", "大小", "状态", "错误/建议"])
+        self.tree.setHeaderLabels(["执行", "名称", "相对路径", "格式", "压缩包大小", "解压后大小", "状态", "错误/建议"])
         self.tree.setAlternatingRowColors(True)
         self.tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
         self.tree.setUniformRowHeights(True)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         self.tree.setColumnWidth(0, 56)
         self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -320,8 +324,10 @@ class MainWindow(QMainWindow):
         self.tree.header().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.tree.header().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.tree.header().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        self.tree.header().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        self.tree.header().setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.header().setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
         self.tree.itemClicked.connect(self._handle_tree_item_clicked)
+        self.tree.customContextMenuRequested.connect(self._open_tree_context_menu)
         self.tree.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         root_layout.addWidget(self.tree, 1)
 
@@ -672,6 +678,30 @@ class MainWindow(QMainWindow):
         self._update_tree_item(archive_item)
         self._refresh_action_state()
 
+    @Slot(QPoint)
+    def _open_tree_context_menu(self, position: QPoint) -> None:
+        tree_item = self.tree.itemAt(position)
+        if not tree_item:
+            return
+
+        path = self._path_from_tree_item(tree_item)
+        if not path:
+            return
+
+        menu = QMenu(self)
+        open_action = menu.addAction("打开")
+        location_action = menu.addAction("打开文件位置")
+        menu.addSeparator()
+        properties_action = menu.addAction("属性")
+
+        selected_action = menu.exec(self.tree.viewport().mapToGlobal(position))
+        if selected_action == open_action:
+            self._open_path(path)
+        elif selected_action == location_action:
+            self._open_path_location(path)
+        elif selected_action == properties_action:
+            self._show_properties(tree_item, path)
+
     def _set_running(self, mode: str | None) -> None:
         self.current_mode = mode
         running = mode is not None
@@ -705,7 +735,9 @@ class MainWindow(QMainWindow):
             for depth in range(len(parts) - 1):
                 dir_key = parts[: depth + 1]
                 if dir_key not in directory_nodes:
-                    node = QTreeWidgetItem(["", parts[depth], str(Path(*dir_key)), "", "", "", ""])
+                    directory_path = scan_result.root_dir / Path(*dir_key)
+                    node = QTreeWidgetItem(["", parts[depth], str(Path(*dir_key)), "", "", "", "", ""])
+                    node.setData(0, Qt.ItemDataRole.UserRole, str(directory_path))
                     node.setExpanded(True)
                     directory_nodes[dir_key] = node
                     parent.addChild(node)
@@ -716,20 +748,23 @@ class MainWindow(QMainWindow):
             leaf.setText(1, item.path.name)
             leaf.setText(2, str(item.relative_path))
             leaf.setText(3, item.archive_format)
-            leaf.setText(4, _format_size(item.size))
-            leaf.setText(5, _display_status(item.status) if item.is_archive else "不可执行")
-            leaf.setText(6, "")
+            leaf.setText(4, _format_size(item.compressed_size))
+            leaf.setText(5, _format_optional_size(item.uncompressed_size) if item.is_archive else "-")
+            leaf.setText(6, _display_status(item.status) if item.is_archive else "不可执行")
+            leaf.setText(7, "")
             leaf.setData(0, Qt.ItemDataRole.UserRole, path_key)
             leaf.setTextAlignment(0, Qt.AlignmentFlag.AlignCenter)
             leaf.setToolTip(0, "点击切换是否执行" if item.is_archive else "普通文件不可执行")
+            leaf.setFont(0, _check_font())
+            leaf.setForeground(0, QColor("#063b3c"))
 
             if item.is_archive:
-                for col in range(7):
+                for col in range(1, 8):
                     leaf.setForeground(col, QColor("#0f8b8d"))
                     leaf.setFont(col, _bold_font())
                 leaf.setBackground(0, QColor("#e3f5f5"))
             else:
-                for col in range(7):
+                for col in range(8):
                     leaf.setForeground(col, QColor("#98a2b3"))
             parent.addChild(leaf)
             self.tree_items_by_path[path_key] = leaf
@@ -746,11 +781,92 @@ class MainWindow(QMainWindow):
             return
         tree_item.setText(0, CHECK_MARK if item.is_archive and item.selected else "")
         tree_item.setBackground(0, QColor("#e3f5f5") if item.selected and item.is_archive else QColor("#ffffff"))
-        tree_item.setText(5, _display_status(item.status) if item.is_archive else "不可执行")
+        tree_item.setForeground(0, QColor("#063b3c") if item.selected and item.is_archive else QColor("#98a2b3"))
+        tree_item.setText(6, _display_status(item.status) if item.is_archive else "不可执行")
         details = item.error
         if item.suggestion:
             details = f"{details}；建议：{item.suggestion}" if details else item.suggestion
-        tree_item.setText(6, details)
+        tree_item.setText(7, details)
+
+    def _path_from_tree_item(self, tree_item: QTreeWidgetItem) -> Path | None:
+        raw_path = tree_item.data(0, Qt.ItemDataRole.UserRole)
+        if not raw_path:
+            return None
+        return Path(str(raw_path))
+
+    def _open_path(self, path: Path) -> None:
+        if not path.exists():
+            QMessageBox.warning(self, "路径不存在", f"路径不存在：\n{path}")
+            return
+        try:
+            os.startfile(path)  # type: ignore[attr-defined]
+        except Exception:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _open_path_location(self, path: Path) -> None:
+        if not path.exists():
+            QMessageBox.warning(self, "路径不存在", f"路径不存在：\n{path}")
+            return
+        if os.name == "nt" and path.is_file():
+            subprocess.Popen(["explorer", f"/select,{path}"])
+            return
+        directory = path if path.is_dir() else path.parent
+        self._open_path(directory)
+
+    def _show_properties(self, tree_item: QTreeWidgetItem, path: Path) -> None:
+        archive_item = self.items_by_path.get(str(path))
+        dialog = QDialog(self)
+        dialog.setWindowTitle("属性")
+        dialog.resize(680, 460)
+        layout = QVBoxLayout(dialog)
+        details = QPlainTextEdit()
+        details.setReadOnly(True)
+        details.setPlainText(self._properties_text(tree_item, path, archive_item))
+        layout.addWidget(details)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+        dialog.exec()
+
+    def _properties_text(
+        self,
+        tree_item: QTreeWidgetItem,
+        path: Path,
+        archive_item: ArchiveItem | None,
+    ) -> str:
+        if archive_item:
+            modified = _format_datetime(archive_item.modified_time)
+            selected = "是" if archive_item.selected and archive_item.is_archive else "否"
+            uncompressed_size = (
+                _format_optional_size(archive_item.uncompressed_size)
+                if archive_item.is_archive
+                else "-"
+            )
+            return "\n".join(
+                [
+                    f"名称: {archive_item.path.name}",
+                    f"绝对路径: {archive_item.path}",
+                    f"相对路径: {archive_item.relative_path}",
+                    f"格式: {archive_item.archive_format}",
+                    f"压缩包大小: {_format_size(archive_item.compressed_size)}",
+                    f"解压后大小: {uncompressed_size}",
+                    f"修改时间: {modified}",
+                    f"是否选中: {selected}",
+                    f"是否可执行: {'是' if archive_item.is_archive else '否'}",
+                    f"状态: {_display_status(archive_item.status)}",
+                    f"错误原因: {archive_item.error or '-'}",
+                    f"建议: {archive_item.suggestion or '-'}",
+                ]
+            )
+
+        return "\n".join(
+            [
+                f"名称: {tree_item.text(1)}",
+                f"路径: {path}",
+                "类型: 目录",
+            ]
+        )
 
     def _append_log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -760,6 +876,13 @@ class MainWindow(QMainWindow):
 def _bold_font() -> QFont:
     font = QFont()
     font.setBold(True)
+    return font
+
+
+def _check_font() -> QFont:
+    font = QFont()
+    font.setBold(True)
+    font.setPointSize(16)
     return font
 
 
@@ -780,6 +903,16 @@ def _format_size(size: int) -> str:
             return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
         value /= 1024
     return f"{size} B"
+
+
+def _format_optional_size(size: int | None) -> str:
+    return _format_size(size) if size is not None else "未知"
+
+
+def _format_datetime(timestamp: float | None) -> str:
+    if timestamp is None:
+        return "未知"
+    return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def main() -> None:
