@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import multiprocessing
+import queue
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime
@@ -54,6 +56,49 @@ FORMAT_OPTIONS = {
 }
 
 CHECK_MARK = "√"
+TAR_FORMATS = {".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz"}
+
+COL_NAME = 0
+COL_EXECUTE = 1
+COL_RELATIVE_PATH = 2
+COL_FORMAT = 3
+COL_COMPRESSED_SIZE = 4
+COL_UNCOMPRESSED_SIZE = 5
+COL_STATUS = 6
+COL_DETAILS = 7
+COLUMN_COUNT = 8
+
+
+def _scan_process_entry(root_dir: str, options: ScanOptions, output_queue, cancel_event) -> None:
+    try:
+        result = scan_archives(
+            Path(root_dir),
+            options,
+            progress_callback=lambda dirs, files, path: output_queue.put(
+                ("progress", dirs, files, str(path or ""))
+            ),
+            cancel_token=_ProcessCancelToken(cancel_event),
+        )
+    except Exception as exc:  # noqa: BLE001 - process boundary should surface failures.
+        output_queue.put(("failed", str(exc)))
+        return
+    output_queue.put(("finished", result))
+
+
+def _execution_process_entry(items: list[ArchiveItem], options: ExecutionOptions, output_queue, cancel_event) -> None:
+    try:
+        results = extract_selected(
+            items,
+            options,
+            progress_callback=lambda index, total, path, status, result: output_queue.put(
+                ("progress", index, total, str(path), status, result)
+            ),
+            cancel_token=_ProcessCancelToken(cancel_event),
+        )
+    except Exception as exc:  # noqa: BLE001 - process boundary should surface failures.
+        output_queue.put(("failed", str(exc)))
+        return
+    output_queue.put(("finished", results))
 
 
 @dataclass(slots=True)
@@ -79,39 +124,76 @@ class AppSettings:
         )
 
 
+class _ProcessCancelToken:
+    def __init__(self, event) -> None:
+        self.event = event
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self.event.is_set()
+
+
 class ScanWorker(QObject):
     progress = Signal(int, int, str)
     finished = Signal(object)
     failed = Signal(str)
+    interrupted = Signal()
 
     def __init__(self, root_dir: Path, options: ScanOptions, cancel_token: CancelToken) -> None:
         super().__init__()
         self.root_dir = root_dir
         self.options = options
         self.cancel_token = cancel_token
+        self.process: multiprocessing.Process | None = None
+        self.cancel_event = None
 
     @Slot()
     def run(self) -> None:
-        try:
-            result = scan_archives(
-                self.root_dir,
-                self.options,
-                progress_callback=self._emit_progress,
-                cancel_token=self.cancel_token,
-            )
-        except Exception as exc:  # noqa: BLE001 - show setup errors in the UI.
-            self.failed.emit(str(exc))
-            return
-        self.finished.emit(result)
+        ctx = multiprocessing.get_context("spawn")
+        output_queue = ctx.Queue()
+        self.cancel_event = ctx.Event()
+        self.process = ctx.Process(
+            target=_scan_process_entry,
+            args=(str(self.root_dir), self.options, output_queue, self.cancel_event),
+            daemon=True,
+        )
+        self.process.start()
 
-    def _emit_progress(self, scanned_dirs: int, scanned_files: int, current_path: Path | None) -> None:
-        self.progress.emit(scanned_dirs, scanned_files, str(current_path or ""))
+        while True:
+            if self.cancel_token.is_cancelled and self.cancel_event is not None:
+                self.cancel_event.set()
+
+            try:
+                message = output_queue.get(timeout=0.1)
+            except queue.Empty:
+                if self.process.exitcode is not None:
+                    if self.process.exitcode != 0:
+                        self.interrupted.emit()
+                    return
+                continue
+
+            kind = message[0]
+            if kind == "progress":
+                _, scanned_dirs, scanned_files, current_path = message
+                self.progress.emit(scanned_dirs, scanned_files, current_path)
+            elif kind == "finished":
+                self.finished.emit(message[1])
+                return
+            elif kind == "failed":
+                self.failed.emit(message[1])
+                return
+
+    def force_stop(self) -> None:
+        if self.process and self.process.is_alive():
+            self.process.terminate()
+            self.process.join(2)
 
 
 class ExecutionWorker(QObject):
     progress = Signal(int, int, str, str, object)
     finished = Signal(object)
     failed = Signal(str)
+    interrupted = Signal()
 
     def __init__(
         self,
@@ -123,30 +205,49 @@ class ExecutionWorker(QObject):
         self.items = items
         self.options = options
         self.cancel_token = cancel_token
+        self.process: multiprocessing.Process | None = None
+        self.cancel_event = None
 
     @Slot()
     def run(self) -> None:
-        try:
-            results = extract_selected(
-                self.items,
-                self.options,
-                progress_callback=self._emit_progress,
-                cancel_token=self.cancel_token,
-            )
-        except Exception as exc:  # noqa: BLE001 - keep worker boundary robust.
-            self.failed.emit(str(exc))
-            return
-        self.finished.emit(results)
+        ctx = multiprocessing.get_context("spawn")
+        output_queue = ctx.Queue()
+        self.cancel_event = ctx.Event()
+        self.process = ctx.Process(
+            target=_execution_process_entry,
+            args=(self.items, self.options, output_queue, self.cancel_event),
+            daemon=True,
+        )
+        self.process.start()
 
-    def _emit_progress(
-        self,
-        index: int,
-        total: int,
-        archive_path: Path,
-        status: str,
-        result: ExtractResult | None,
-    ) -> None:
-        self.progress.emit(index, total, str(archive_path), status, result)
+        while True:
+            if self.cancel_token.is_cancelled and self.cancel_event is not None:
+                self.cancel_event.set()
+
+            try:
+                message = output_queue.get(timeout=0.1)
+            except queue.Empty:
+                if self.process.exitcode is not None:
+                    if self.process.exitcode != 0:
+                        self.interrupted.emit()
+                    return
+                continue
+
+            kind = message[0]
+            if kind == "progress":
+                _, index, total, archive_path, status, result = message
+                self.progress.emit(index, total, archive_path, status, result)
+            elif kind == "finished":
+                self.finished.emit(message[1])
+                return
+            elif kind == "failed":
+                self.failed.emit(message[1])
+                return
+
+    def force_stop(self) -> None:
+        if self.process and self.process.is_alive():
+            self.process.terminate()
+            self.process.join(2)
 
 
 class SettingsDialog(QDialog):
@@ -159,17 +260,6 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(14)
-
-        format_group = QGroupBox("文件类型过滤")
-        format_layout = QHBoxLayout(format_group)
-        self.format_checks: dict[str, QCheckBox] = {}
-        for value, label in FORMAT_OPTIONS.items():
-            checkbox = QCheckBox(label)
-            checkbox.setChecked(value in settings.enabled_formats)
-            self.format_checks[value] = checkbox
-            format_layout.addWidget(checkbox)
-        format_layout.addStretch(1)
-        layout.addWidget(format_group)
 
         scan_group = QGroupBox("扫描参数")
         scan_layout = QGridLayout(scan_group)
@@ -206,11 +296,8 @@ class SettingsDialog(QDialog):
         layout.addWidget(buttons)
 
     def selected_settings(self) -> AppSettings:
-        enabled_formats = tuple(
-            value for value, checkbox in self.format_checks.items() if checkbox.isChecked()
-        )
         return AppSettings(
-            enabled_formats=enabled_formats,
+            enabled_formats=self.settings.enabled_formats,
             max_depth_enabled=self.max_depth_check.isChecked(),
             max_depth=self.max_depth_spin.value(),
             show_all_files=self.show_all_check.isChecked(),
@@ -233,6 +320,7 @@ class MainWindow(QMainWindow):
         self.items_by_path: dict[str, ArchiveItem] = {}
         self.tree_items_by_path: dict[str, QTreeWidgetItem] = {}
         self.failed_paths: set[str] = set()
+        self.active_items: list[ArchiveItem] = []
 
         self._build_ui()
         self._apply_style()
@@ -284,20 +372,32 @@ class MainWindow(QMainWindow):
         self.retry_button.clicked.connect(self._retry_failed)
         self.cancel_button = QPushButton("取消")
         self.cancel_button.clicked.connect(self._cancel_current_task)
+        self.force_button = QPushButton("强制中断")
+        self.force_button.clicked.connect(self._force_interrupt_current_task)
         self.settings_button = QPushButton("设置")
         self.settings_button.clicked.connect(self._open_settings)
         self.show_all_checkbox = QCheckBox("显示所有文件")
         self.show_all_checkbox.setChecked(self.settings.show_all_files)
         self.show_all_checkbox.toggled.connect(self._on_show_all_toggled)
+        self.format_checks: dict[str, QCheckBox] = {}
+        for value, label in FORMAT_OPTIONS.items():
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(value in self.settings.enabled_formats)
+            checkbox.toggled.connect(self._on_format_toggled)
+            self.format_checks[value] = checkbox
 
         button_row = QHBoxLayout()
         button_row.addWidget(self.scan_button)
         button_row.addWidget(self.execute_button)
         button_row.addWidget(self.retry_button)
+        button_row.addSpacing(8)
+        for checkbox in self.format_checks.values():
+            button_row.addWidget(checkbox)
         button_row.addWidget(self.show_all_checkbox)
         button_row.addStretch(1)
         button_row.addWidget(self.settings_button)
         button_row.addWidget(self.cancel_button)
+        button_row.addWidget(self.force_button)
         control_layout.addLayout(button_row, 1, 0, 1, 3)
         root_layout.addWidget(control_panel)
 
@@ -312,20 +412,21 @@ class MainWindow(QMainWindow):
         root_layout.addLayout(progress_row)
 
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["执行", "名称", "相对路径", "格式", "压缩包大小", "解压后大小", "状态", "错误/建议"])
+        self.tree.setHeaderLabels(["名称", "执行", "相对路径", "格式", "压缩包大小", "解压后大小", "状态", "错误/建议"])
         self.tree.setAlternatingRowColors(True)
         self.tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
         self.tree.setUniformRowHeights(True)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self.tree.setColumnWidth(0, 56)
-        self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.tree.header().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.tree.header().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        self.tree.header().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        self.tree.header().setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
-        self.tree.header().setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+        self.tree.setIndentation(32)
+        self.tree.header().setSectionResizeMode(COL_NAME, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.header().setSectionResizeMode(COL_EXECUTE, QHeaderView.ResizeMode.Fixed)
+        self.tree.setColumnWidth(COL_EXECUTE, 56)
+        self.tree.header().setSectionResizeMode(COL_RELATIVE_PATH, QHeaderView.ResizeMode.Stretch)
+        self.tree.header().setSectionResizeMode(COL_FORMAT, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.header().setSectionResizeMode(COL_COMPRESSED_SIZE, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.header().setSectionResizeMode(COL_UNCOMPRESSED_SIZE, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.header().setSectionResizeMode(COL_STATUS, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.header().setSectionResizeMode(COL_DETAILS, QHeaderView.ResizeMode.Stretch)
         self.tree.itemClicked.connect(self._handle_tree_item_clicked)
         self.tree.customContextMenuRequested.connect(self._open_tree_context_menu)
         self.tree.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -450,6 +551,9 @@ class MainWindow(QMainWindow):
                 gridline-color: #e4e9f0;
                 alternate-background-color: #fafbfd;
             }
+            QTreeWidget::branch {
+                border-left: 1px solid #cfd8e5;
+            }
             """
         )
 
@@ -475,11 +579,16 @@ class MainWindow(QMainWindow):
             self.show_all_checkbox.setChecked(self.settings.show_all_files)
             self._append_log(
                 "设置已更新："
-                f"格式={', '.join(self.settings.enabled_formats)}，"
                 f"线程={self.settings.worker_count}，"
                 f"显示所有文件={'是' if self.settings.show_all_files else '否'}，"
                 f"删除源文件={'是' if self.settings.delete_source else '否'}"
             )
+
+    @Slot(bool)
+    def _on_format_toggled(self, _checked: bool) -> None:
+        self.settings.enabled_formats = self.enabled_formats_from_main_controls()
+        formats = ", ".join(self.settings.enabled_formats) if self.settings.enabled_formats else "无"
+        self._append_log(f"格式过滤已更新：{formats}（重新扫描后生效）")
 
     @Slot(bool)
     def _on_show_all_toggled(self, checked: bool) -> None:
@@ -489,11 +598,16 @@ class MainWindow(QMainWindow):
     @Slot()
     def _start_scan(self) -> None:
         root_dir = Path(self.path_input.text().strip()).expanduser()
+        self.settings.enabled_formats = self.enabled_formats_from_main_controls()
+        if not self.settings.enabled_formats:
+            QMessageBox.warning(self, "缺少格式", "请至少选择一种压缩格式。")
+            return
         if not root_dir.exists() or not root_dir.is_dir():
             QMessageBox.warning(self, "目录无效", "请选择一个存在的目标目录。")
             return
 
         self.scan_result = None
+        self.active_items = []
         self.items_by_path.clear()
         self.tree_items_by_path.clear()
         self.failed_paths.clear()
@@ -510,6 +624,7 @@ class MainWindow(QMainWindow):
         self.worker.progress.connect(self._handle_scan_progress)
         self.worker.finished.connect(self._handle_scan_finished)
         self.worker.failed.connect(self._handle_worker_failed)
+        self.worker.interrupted.connect(self._handle_worker_interrupted)
         self.worker.finished.connect(self.worker_thread.quit)
         self.worker.failed.connect(self.worker_thread.quit)
         self.worker_thread.finished.connect(self.worker.deleteLater)
@@ -546,6 +661,7 @@ class MainWindow(QMainWindow):
             f"线程={self.settings.worker_count}，"
             f"删除源文件={'是' if self.settings.delete_source else '否'}"
         )
+        self.active_items = list(items)
 
         for item in items:
             item.status = "pending"
@@ -562,6 +678,7 @@ class MainWindow(QMainWindow):
         self.worker.progress.connect(self._handle_execution_progress)
         self.worker.finished.connect(self._handle_execution_finished)
         self.worker.failed.connect(self._handle_worker_failed)
+        self.worker.interrupted.connect(self._handle_worker_interrupted)
         self.worker.finished.connect(self.worker_thread.quit)
         self.worker.failed.connect(self.worker_thread.quit)
         self.worker_thread.finished.connect(self.worker.deleteLater)
@@ -577,6 +694,18 @@ class MainWindow(QMainWindow):
             self.cancel_button.setEnabled(False)
             self.summary_label.setText("正在取消...")
             self._append_log("已请求取消，正在等待当前任务收尾。")
+
+    @Slot()
+    def _force_interrupt_current_task(self) -> None:
+        if not self.worker:
+            return
+        self.summary_label.setText("正在强制中断...")
+        self.force_button.setEnabled(False)
+        self.cancel_button.setEnabled(False)
+        self._append_log("已请求强制中断。当前正在写出的解压内容可能不完整，请检查目标目录或重试该文件。")
+        force_stop = getattr(self.worker, "force_stop", None)
+        if callable(force_stop):
+            force_stop()
 
     @Slot(int, int, str)
     def _handle_scan_progress(self, scanned_dirs: int, scanned_files: int, current_path: str) -> None:
@@ -598,6 +727,7 @@ class MainWindow(QMainWindow):
         self._append_log(
             f"扫描完成：发现 {len(scan_result.items)} 个显示项，其中 {archive_count} 个可执行压缩包。"
         )
+        self.active_items = []
         self._set_running(None)
 
     @Slot(int, int, str, str, object)
@@ -640,14 +770,16 @@ class MainWindow(QMainWindow):
         success_count = sum(1 for item in results if item.status == "success")
         failed_count = sum(1 for item in results if item.status == "failed")
         skipped_count = sum(1 for item in results if item.status == "skipped")
+        interrupted_count = sum(1 for item in results if item.status == "interrupted")
         deleted_count = sum(1 for item in results if item.deleted_source)
         self.progress_bar.setValue(100 if results else 0)
         summary = (
             f"执行完成：成功 {success_count}，失败 {failed_count}，"
-            f"跳过 {skipped_count}，删除 {deleted_count}"
+            f"跳过 {skipped_count}，中断 {interrupted_count}，删除 {deleted_count}"
         )
         self.summary_label.setText(summary)
         self._append_log(summary)
+        self.active_items = []
 
     @Slot(str)
     def _handle_worker_failed(self, message: str) -> None:
@@ -658,6 +790,14 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "任务失败", message)
 
     @Slot()
+    def _handle_worker_interrupted(self) -> None:
+        self.mark_unfinished_items_interrupted()
+        self.progress_bar.setRange(0, 100)
+        self._set_running(None)
+        self.summary_label.setText("已强制中断")
+        self._append_log("任务已强制中断。未完成项目已标记为“已中断”，可用“重试失败”继续处理。")
+
+    @Slot()
     def _clear_worker_refs(self) -> None:
         self.worker = None
         self.worker_thread = None
@@ -666,9 +806,9 @@ class MainWindow(QMainWindow):
 
     @Slot(QTreeWidgetItem, int)
     def _handle_tree_item_clicked(self, item: QTreeWidgetItem, column: int) -> None:
-        if column != 0 or self.current_mode:
+        if column != COL_EXECUTE or self.current_mode:
             return
-        path = item.data(0, Qt.ItemDataRole.UserRole)
+        path = item.data(COL_NAME, Qt.ItemDataRole.UserRole)
         if not path:
             return
         archive_item = self.items_by_path.get(path)
@@ -709,8 +849,11 @@ class MainWindow(QMainWindow):
         self.execute_button.setEnabled(not running and bool(self._selected_archive_items()))
         self.retry_button.setEnabled(not running and bool(self.failed_paths))
         self.cancel_button.setEnabled(running)
+        self.force_button.setEnabled(running)
         self.settings_button.setEnabled(not running)
         self.show_all_checkbox.setEnabled(not running)
+        for checkbox in self.format_checks.values():
+            checkbox.setEnabled(not running)
         self.browse_button.setEnabled(not running)
         self.path_input.setEnabled(not running)
 
@@ -719,6 +862,20 @@ class MainWindow(QMainWindow):
             return
         self.execute_button.setEnabled(bool(self._selected_archive_items()))
         self.retry_button.setEnabled(bool(self.failed_paths))
+
+    def enabled_formats_from_main_controls(self) -> tuple[str, ...]:
+        return tuple(value for value, checkbox in self.format_checks.items() if checkbox.isChecked())
+
+    def mark_unfinished_items_interrupted(self) -> None:
+        for item in self.active_items:
+            if item.is_archive and item.status not in {"success", "failed", "skipped"}:
+                item.status = "interrupted"
+                item.error = "任务被强制中断"
+                item.error_type = "interrupted"
+                item.suggestion = "请检查目标目录是否存在不完整解压内容，然后重试该文件。"
+                self.failed_paths.add(str(item.path))
+                self._update_tree_item(item)
+        self._refresh_action_state()
 
     def _populate_tree(self, scan_result: ScanResult) -> None:
         self.tree.clear()
@@ -736,35 +893,53 @@ class MainWindow(QMainWindow):
                 dir_key = parts[: depth + 1]
                 if dir_key not in directory_nodes:
                     directory_path = scan_result.root_dir / Path(*dir_key)
-                    node = QTreeWidgetItem(["", parts[depth], str(Path(*dir_key)), "", "", "", "", ""])
-                    node.setData(0, Qt.ItemDataRole.UserRole, str(directory_path))
+                    node = QTreeWidgetItem(
+                        [
+                            parts[depth],
+                            "",
+                            str(Path(*dir_key)),
+                            "",
+                            "",
+                            "",
+                            "",
+                            "",
+                        ]
+                    )
+                    node.setData(COL_NAME, Qt.ItemDataRole.UserRole, str(directory_path))
                     node.setExpanded(True)
+                    for col in range(COLUMN_COUNT):
+                        node.setForeground(col, QColor("#344054"))
+                    node.setFont(COL_NAME, _bold_font())
                     directory_nodes[dir_key] = node
                     parent.addChild(node)
                 parent = directory_nodes[dir_key]
 
             leaf = QTreeWidgetItem()
-            leaf.setText(0, CHECK_MARK if item.is_archive and item.selected else "")
-            leaf.setText(1, item.path.name)
-            leaf.setText(2, str(item.relative_path))
-            leaf.setText(3, item.archive_format)
-            leaf.setText(4, _format_size(item.compressed_size))
-            leaf.setText(5, _format_optional_size(item.uncompressed_size) if item.is_archive else "-")
-            leaf.setText(6, _display_status(item.status) if item.is_archive else "不可执行")
-            leaf.setText(7, "")
-            leaf.setData(0, Qt.ItemDataRole.UserRole, path_key)
-            leaf.setTextAlignment(0, Qt.AlignmentFlag.AlignCenter)
-            leaf.setToolTip(0, "点击切换是否执行" if item.is_archive else "普通文件不可执行")
-            leaf.setFont(0, _check_font())
-            leaf.setForeground(0, QColor("#063b3c"))
+            leaf.setText(COL_NAME, item.path.name)
+            leaf.setText(COL_EXECUTE, CHECK_MARK if item.is_archive and item.selected else "")
+            leaf.setText(COL_RELATIVE_PATH, str(item.relative_path))
+            leaf.setText(COL_FORMAT, item.archive_format)
+            leaf.setText(COL_COMPRESSED_SIZE, _format_size(item.compressed_size))
+            leaf.setText(COL_UNCOMPRESSED_SIZE, _format_optional_size(item.uncompressed_size) if item.is_archive else "-")
+            leaf.setText(COL_STATUS, _display_status(item.status) if item.is_archive else "不可执行")
+            leaf.setText(COL_DETAILS, "")
+            leaf.setData(COL_NAME, Qt.ItemDataRole.UserRole, path_key)
+            leaf.setTextAlignment(COL_EXECUTE, Qt.AlignmentFlag.AlignCenter)
+            leaf.setToolTip(COL_EXECUTE, "点击切换是否执行" if item.is_archive else "普通文件不可执行")
+            leaf.setFont(COL_EXECUTE, _check_font())
+            leaf.setForeground(COL_EXECUTE, QColor("#063b3c"))
 
             if item.is_archive:
-                for col in range(1, 8):
-                    leaf.setForeground(col, QColor("#0f8b8d"))
+                color = archive_color(item.archive_format)
+                for col in range(COLUMN_COUNT):
+                    if col == COL_EXECUTE:
+                        continue
+                    leaf.setForeground(col, color)
                     leaf.setFont(col, _bold_font())
-                leaf.setBackground(0, QColor("#e3f5f5"))
+                leaf.setBackground(COL_EXECUTE, QColor("#e3f5f5"))
+                leaf.setFont(COL_FORMAT, _bold_font())
             else:
-                for col in range(8):
+                for col in range(COLUMN_COUNT):
                     leaf.setForeground(col, QColor("#98a2b3"))
             parent.addChild(leaf)
             self.tree_items_by_path[path_key] = leaf
@@ -779,17 +954,23 @@ class MainWindow(QMainWindow):
         tree_item = self.tree_items_by_path.get(str(item.path))
         if not tree_item:
             return
-        tree_item.setText(0, CHECK_MARK if item.is_archive and item.selected else "")
-        tree_item.setBackground(0, QColor("#e3f5f5") if item.selected and item.is_archive else QColor("#ffffff"))
-        tree_item.setForeground(0, QColor("#063b3c") if item.selected and item.is_archive else QColor("#98a2b3"))
-        tree_item.setText(6, _display_status(item.status) if item.is_archive else "不可执行")
+        tree_item.setText(COL_EXECUTE, CHECK_MARK if item.is_archive and item.selected else "")
+        tree_item.setBackground(
+            COL_EXECUTE,
+            QColor("#e3f5f5") if item.selected and item.is_archive else QColor("#ffffff"),
+        )
+        tree_item.setForeground(
+            COL_EXECUTE,
+            QColor("#063b3c") if item.selected and item.is_archive else QColor("#98a2b3"),
+        )
+        tree_item.setText(COL_STATUS, _display_status(item.status) if item.is_archive else "不可执行")
         details = item.error
         if item.suggestion:
             details = f"{details}；建议：{item.suggestion}" if details else item.suggestion
-        tree_item.setText(7, details)
+        tree_item.setText(COL_DETAILS, details)
 
     def _path_from_tree_item(self, tree_item: QTreeWidgetItem) -> Path | None:
-        raw_path = tree_item.data(0, Qt.ItemDataRole.UserRole)
+        raw_path = tree_item.data(COL_NAME, Qt.ItemDataRole.UserRole)
         if not raw_path:
             return None
         return Path(str(raw_path))
@@ -862,7 +1043,7 @@ class MainWindow(QMainWindow):
 
         return "\n".join(
             [
-                f"名称: {tree_item.text(1)}",
+                f"名称: {tree_item.text(COL_NAME)}",
                 f"路径: {path}",
                 "类型: 目录",
             ]
@@ -893,7 +1074,19 @@ def _display_status(status: str) -> str:
         "success": "成功",
         "failed": "失败",
         "skipped": "已跳过",
+        "interrupted": "已中断",
     }.get(status, status)
+
+
+def archive_color(archive_format: str) -> QColor:
+    normalized = archive_format.lower()
+    if normalized == ".zip":
+        return QColor("#0f8b8d")
+    if normalized == ".7z":
+        return QColor("#7c3aed")
+    if normalized in TAR_FORMATS or normalized == ".tar*":
+        return QColor("#2563eb")
+    return QColor("#98a2b3")
 
 
 def _format_size(size: int) -> str:
